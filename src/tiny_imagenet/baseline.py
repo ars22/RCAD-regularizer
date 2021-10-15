@@ -97,6 +97,8 @@ class Baseline(tf.keras.Model):
     self.acc_tracker.update_state(acc)
     return {"ce_loss": self.ce_loss_tracker.result(), "ent": self.ent_tracker.result(), "accuracy": self.acc_tracker.result()}
 
+  def call(self, X):
+    pass
 
   @property
   def metrics(self):

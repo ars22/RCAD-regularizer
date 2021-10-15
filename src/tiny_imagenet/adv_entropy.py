@@ -85,13 +85,13 @@ class AdvEntropy(tf.keras.Model):
     X, Y = data
     X_adv = self.adv_step(X, Y, step_size=self.args.step_size)
     with tf.GradientTape() as tape:
-      Y_hat = self.model(X, training=True) 
-      ce_loss = tf.keras.losses.CategoricalCrossentropy(from_logits=True)(y_true=Y, y_pred=Y_hat)
+      Y_logits = self.model(X, training=True) 
+      ce_loss = tf.keras.losses.CategoricalCrossentropy(from_logits=True)(y_true=Y, y_pred=Y_logits)
       Y_hat_adv = self.model(X_adv, training=True) 
       adv_loss = KLUnif(Y_hat_adv)
       total_loss = ce_loss + self.args.lambd * adv_loss
-    acc = accuracy(Y_hat, Y) 
-    ent = entropy(Y_hat)
+    acc = accuracy(Y_logits, Y) 
+    ent = entropy(Y_logits, from_logits=True)
     # Compute gradients
     gradients = tape.gradient(total_loss, self.model.trainable_variables)
     # Update weights
@@ -108,10 +108,10 @@ class AdvEntropy(tf.keras.Model):
   @tf.function
   def test_step(self, data):
     X, Y = data
-    Y_hat = self.model(X, training=False)
-    ent = entropy(Y_hat)
-    ce_loss = tf.keras.losses.CategoricalCrossentropy(from_logits=False)(y_true=Y, y_pred=Y_hat)
-    acc = accuracy(Y_hat, Y)
+    Y_logits = self.model(X, training=False)
+    ent = entropy(Y_logits, from_logits=True)
+    ce_loss = tf.keras.losses.CategoricalCrossentropy(from_logits=True)(y_true=Y, y_pred=Y_logits)
+    acc = accuracy(Y_logits, Y)
     self.ent_tracker.update_state(ent)
     self.ce_loss_tracker.update_state(ce_loss)
     self.ent_tracker.update_state(ent)
@@ -119,7 +119,7 @@ class AdvEntropy(tf.keras.Model):
     return {"ce_loss": self.ce_loss_tracker.result(), "ent": self.ent_tracker.result(), "accuracy": self.acc_tracker.result()}
 
   def call(self, X):
-    return self.model(X)
+    pass
 
 
   @property
