@@ -9,6 +9,7 @@ from pyhessian import hessian # Hessian computation
 import torch
 import time
 import torch.nn as nn
+from collections import defaultdict
 from torch.autograd import Variable, grad_mode
 import torch.backends.cudnn as cudnn
 from torch.optim.lr_scheduler import MultiStepLR
@@ -224,7 +225,6 @@ test_loader = torch.utils.data.DataLoader(dataset=test_dataset,
 
 
 # model, criterion and optimizer
-tau = torch.nn.Parameter(torch.tensor([1.]).cuda())
 if args.model == 'resnet18':
     cnn = ResNet18(num_classes=num_classes)
 elif args.model == 'wideresnet':
@@ -262,21 +262,28 @@ def calc_entropy(x, from_logits=True):
   
 
 # logging
+if not os.path.exists('logs/'):
+    os.mkdir('logs/')
 filename = 'logs/' + test_id + '.csv'
 print("Saving at ", filename)
 import os
 if os.path.exists(filename):
     os.remove(filename)
     print("Deleting existing ", filename)
-csv_logger = CSVLogger(args=args, fieldnames=[
+metric_keys = [ 
     'epoch', 
-    'train_acc',
-    'test_acc', 
-    'train_loss', 
+    'acc_train',
+    'loss_train',
+    'cent_loss_train',
+    'pred_ent_train',
+    'pred_ent_adv_train',
+    'acc_test', 
+    'cent_loss_test',
     'grad_norm',
     'reg',
-    'l2_dist'], 
-filename=filename)
+    'l2_dist']
+metrics = {k:[] for k in metric_keys}
+csv_logger = CSVLogger(args=args, fieldnames=metric_keys, filename=filename)
 
 
 # checkpoints
@@ -291,115 +298,76 @@ if args.checkpoint_path != '':
 
 
 # testing
-def test(model, loader):
+def test(model, loader, metrics):
     model.eval()    # change model to 'eval' mode (BN uses moving mean/var).
-    correct = 0.
-    total = 0.
-    for images, labels in loader:
+    total_img = 0
+    for i, (images, labels) in enumerate(loader):
         images = images.cuda()
         labels = labels.cuda()
         with torch.no_grad():
             pred = model(normalize(images))
-        pred = torch.max(pred.data, 1)[1]
-        total += labels.size(0)
-        correct += (pred == labels).sum().item()
-    val_acc = correct / total
+            metrics['cent_loss_test'][-1] += cent_loss(pred, labels).item()
+        metrics['acc_test'][-1] += (torch.max(pred.data, 1)[1] == labels).sum().item()        
+        total_img += len(labels)
+    metrics['acc_test'][-1] /= total_img
+    metrics['cent_loss_test'][-1] /= (i+1)
     model.train()
-    return val_acc
 
 
 # pgd attack
-def attack_pgd(model, X, y, epsilon, alpha, attack_iters,
-               early_stop=False, random=False, p=False):
-    upper_limit, lower_limit = 1, 0
+def attack_pgd(model, X, y):
     delta = torch.zeros_like(X).cuda()
-    if random:
-        delta.uniform_(-epsilon, epsilon)
-    delta = torch.clamp(delta, lower_limit-X, upper_limit-X)
     delta.requires_grad = True
-    for _ in range(attack_iters):
-        output = model(normalize(X + delta))
-        if early_stop:
-            index = torch.where(output.max(1)[1] == y)[0]
-        else:
-            index = slice(None,None,None)
-        if not isinstance(index, slice) and len(index) == 0:
-            break
-        loss = cent_loss(cnn(normalize(X+delta)), y) * len(X)
-        loss.backward()
-        grad = delta.grad.detach()
-        grad = delta.grad
-        d = delta[index, :, :, :]
-        g = grad[index, :, :, :]
-        x = X[index, :, :, :]
-        
-        g_norm = torch.norm(g.view(g.shape[0],-1),dim=1).view(-1,1,1,1)
-        scaled_g = g/(g_norm + 1e-10)
-        d = (d + scaled_g*alpha).view(d.size(0),-1).renorm(p=2,dim=0,maxnorm=epsilon).view_as(d)
-        
-        delta.data[index, :, :, :] = d
-        delta.grad.zero_()
-    return delta
+    output = model(normalize(X + delta))
+    index = slice(None,None,None)
+    loss = cent_loss(cnn(normalize(X+delta)), y) * len(X)
+    loss.backward()
+    grad = delta.grad.detach()
+    grad = delta.grad
+    g = grad[index, :, :, :]    
+    g_norm = torch.norm(g.view(g.shape[0],-1),dim=1).view(-1,1,1,1)
+    scaled_g = g/(g_norm + 1e-10)
+    return scaled_g
 
 
     
 # training
+max_ent = - np.log(1./num_classes)
 for epoch in range(args.start_epoch, args.epochs):
 
-    xentropy_loss_avg = 0.
-    grad_norm_avg = 0.
-    loss_avg = 0.
-    reg_avg = 0.
-    max_ent = - np.log(1./num_classes)
-
-    correct = 0.
-    total = 0.
-
+    for key in metric_keys:
+        metrics[key].append(0.)
+    metrics['epoch'][-1] = epoch
     progress_bar = tqdm(train_loader)
+    progress_bar.set_description('Epoch ' + str(epoch))
     tqdm.write('learning_rate: %.5f' % (cnn_optimizer.param_groups[0]['lr']))
-    
-    before_adv = []
-    after_adv = []
+        
     for i, (images, labels) in enumerate(progress_bar):
         
-        progress_bar.set_description('Epoch ' + str(epoch))
-
         images = images.cuda()
         labels = labels.cuda()
         aug_images = augment(images)
   
         cnn = set_track_bn_stats(cnn, False)
         z = images
-        
+        metrics['pred_ent_train'][-1] += cnn.pred_ent(normalize(z)).mean().item()
         d = attack_pgd(
-            model=cnn, X=images, y=labels, epsilon=args.epsilon, alpha=args.alpha, 
-            attack_iters=args.attack_iters, early_stop=False) 
-            
-        
-        with torch.no_grad():
-            after_adv.append([
-                cnn.pred_ent(normalize(z+d)).mean().item(), 
-                cent_loss(cnn(normalize(z+d)), labels).item(),
-                (cnn(normalize(z+d)).argmax(1) == labels.data).sum().item() / len(labels)])
-        l2_dist = torch.norm(d.view(len(z), -1), dim=1, p=2).mean().item()
-        noise = torch.ones(size=d.shape, device=d.get_device()).uniform_(-0.01, 0.01)
-        dhat = d + noise
-        scaled_dhat = dhat
-        reg =  args.lambd * (max_ent - cnn.pred_ent(normalize(z + tau * (scaled_dhat))).mean())
+            model=cnn, X=images, y=labels)    
+        metrics['pred_ent_adv_train'][-1] += cnn.pred_ent(normalize(z + args.alpha * d)).mean().item()
+        metrics['l2_dist'][-1] += args.alpha * torch.norm(d.view(len(z), -1), dim=1, p=2).mean().item()
+        reg =  args.lambd * (max_ent - cnn.pred_ent(normalize(z + args.alpha * d)).mean())
         cnn = set_track_bn_stats(cnn, True)
           
         cnn_optimizer.zero_grad()
         # prediction on aug image
         pred_aug = cnn(normalize(aug_images))
-        # pred_aug = cnn(normalize(torch.cat([aug_images, images], dim=0)))
-
         # prediction on actual image
         pred = cnn(normalize(images))
 
-        x_entropy_loss_noaug = cent_loss_with_smoothing(pred, labels)
-        xentropy_loss = cent_loss_with_smoothing(pred_aug, labels)
-        total_loss = 0.5 * (xentropy_loss + x_entropy_loss_noaug) + reg
-
+        xentropy_loss = cent_loss_with_smoothing(pred, labels)
+        xentropy_loss_aug = cent_loss_with_smoothing(pred_aug, labels)
+        total_xentropy_loss = 0.5 * (xentropy_loss + xentropy_loss_aug)
+        total_loss = total_xentropy_loss + reg
 
         # backprop        
         total_loss.backward()
@@ -407,56 +375,53 @@ for epoch in range(args.start_epoch, args.epochs):
         grad_norm = compute_grad_norm(cnn)
         cnn_optimizer.step()
         
-
         # metrics        
-        xentropy_loss_avg += xentropy_loss.item()
-        loss_avg += total_loss.item()
-        reg_avg += reg.item()
-        grad_norm_avg += grad_norm
-
-
+        metrics['cent_loss_train'][-1] += xentropy_loss.item()
+        metrics['loss_train'][-1] += total_loss.item()
+        metrics['reg'][-1] += reg.item()
+        metrics['grad_norm'][-1] += grad_norm
+        
         # Calculate running average of accuracy
-        pred = torch.max(pred_aug.data, 1)[1]
-        total += len(pred_aug)
-        correct += (pred == (labels.data if len(pred) == len(labels) else torch.cat([labels, labels], dim=0).data)).sum().item()
-        accuracy = correct / total
+        acc = (torch.max(pred.data, 1)[1] == labels.data).sum().item() / len(pred)
+        metrics['acc_train'][-1] += acc
         progress_bar.set_postfix(
-            loss='%.3f' % (loss_avg / (i+1)),
-            acc='%.3f' % accuracy,
-            gn='%.3f' % (grad_norm_avg/ (i+1)),
-            reg='%.3f' % reg.item(),
-            tau='%.3f' % tau.item())
+            loss='%.3f' % total_loss.item(),
+            acc='%.3f' % acc,
+            gn='%.3f' % grad_norm,
+            reg='%.3f' % reg.item())
 
+    # epoch over train
+    metrics['cent_loss_train'][-1] /= (i+1)
+    metrics['loss_train'][-1] /= (i+1)
+    metrics['reg'][-1] /= (i+1)
+    metrics['grad_norm'][-1] /= (i+1)
+    metrics['pred_ent_train'][-1] /= (i+1)
+    metrics['pred_ent_adv_train'][-1] /= (i+1)
+    metrics['acc_train'][-1] /= (i+1) 
+    metrics['l2_dist'][-1] /= (i+1)
 
     # run test
-    test_acc = test(cnn, test_loader)
+    test(cnn, test_loader, metrics)
     scheduler.step()
-    # scheduler_tau.step()
-    tqdm.write('test_acc: %.3f' % test_acc)
     
-
     # saving
     if epoch % args.save_freq == 0:
+        if not os.path.exists('checkpoints/'):
+            os.mkdir('checkpoints/')
         cnn.eval()
         torch.save({
             'model': cnn.state_dict(),
             'optimizer': cnn_optimizer.state_dict()
         }, 'checkpoints/' + test_id + f'_{epoch}.pt')
         cnn.train()
-    row = {
-        'epoch': str(epoch),
-        'train_acc': str(accuracy), 
-        'test_acc': str(test_acc), 
-        'grad_norm': str(grad_norm_avg / (i+1)),
-        'train_loss': str(loss_avg / (i+1)),
-        'reg': str(reg_avg / (i+1)),
-        'l2_dist': str(l2_dist)
-    }
+    
+    # logs
+    row = {k:('%d' if type(metrics[k][-1]) == int else '%.4f') % metrics[k][-1] for k in metric_keys}
     csv_logger.writerow(row)
-    before_adv = np.array(before_adv)
-    after_adv = np.array(after_adv)
-    tqdm.write('before_adv ent: %.3f loss: %.3f acc: %.3f' % (before_adv.mean(0)[0], before_adv.mean(0)[1], before_adv.mean(0)[2]))
-    tqdm.write('after_adv ent: %.3f loss: %.3f acc: %.3f' % (after_adv.mean(0)[0], after_adv.mean(0)[1], after_adv.mean(0)[2]))
-
+    for k in row:
+        tqdm.write(f'{k}: {row[k]}')
+    tqdm.write('\n')
+    
+    
 torch.save({'model': cnn.state_dict(), 'optimizer': cnn_optimizer.state_dict()}, 'checkpoints/' + test_id + '_last.pt')
 csv_logger.close()
