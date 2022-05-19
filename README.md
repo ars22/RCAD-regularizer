@@ -1,3 +1,3 @@
-# [RCAD]: Reducing Confidence Along Adversarial Directions 
+## [RCAD]: Reducing Confidence Along Adversarial Directions 
 
-## Instructions to setup and run CIFAR-100-2k experiments
+### Instructions to setup and run CIFAR-100-2k experiments
